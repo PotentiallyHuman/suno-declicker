@@ -120,8 +120,8 @@ python declicker.py song.mp3 --out fixed.wav
 
 ```
 suno-declicker
-  Input    : Vanish With the Year (Remaster 5.5).mp3
-  Output   : Vanish With the Year (Remaster 5.5)_clean.wav
+  Input    : my_song.mp3
+  Output   : my_song_clean.wav
 
   44100 Hz | 2ch | 258.5s
 
@@ -138,8 +138,8 @@ suno-declicker
 
   Repairing with stems (original kept everywhere else)...
 
-  Original untouched : Vanish With the Year (Remaster 5.5).mp3
-  Clean copy saved   : Vanish With the Year (Remaster 5.5)_clean.wav
+  Original untouched : my_song.mp3
+  Clean copy saved   : my_song_clean.wav
 ```
 
 ## Tuning
