@@ -165,11 +165,20 @@ def demetalize(song, fingerprint, envelope, sr, strength=0.8,
         n_frames = mag.shape[1]
         env_t = env[:n_frames] if len(env) >= n_frames else np.pad(env, (0, n_frames - len(env)))
 
+        # level gate: suppress less in quiet sections to protect delicate passages
+        # compute per-frame RMS of the mix
+        frame_rms = mag.mean(axis=0)  # proxy for mix level per frame
+        # normalise against song median so the gate is relative not absolute
+        median_rms  = np.median(frame_rms) + 1e-10
+        level_gate  = np.clip(frame_rms / (median_rms * 0.5), 0.0, 1.0).astype(np.float32)
+
         # subtraction applies only within the frequency band AND during reverb tail
+        # AND scales down in quiet frames (level gate)
         subtraction = (strength
                        * fingerprint[:, None]   # (n_freqs, 1)
                        * freq_mask[:, None]      # (n_freqs, 1) — zero outside band
-                       * env_t[None, :])         # (1, n_frames) — zero when singing
+                       * env_t[None, :]          # (1, n_frames) — zero when singing
+                       * level_gate[None, :])    # (1, n_frames) — zero in quiet passages
 
         hard_floor = mag * floor
         mag_clean  = np.maximum(mag - subtraction, hard_floor)
