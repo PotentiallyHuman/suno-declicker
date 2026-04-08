@@ -1,6 +1,5 @@
 """
-suno-deshimmer — removes AI generation noise floor (hiss/shimmer) from Suno songs,
-then restores natural spaciousness with a clean reverb tail in the filtered band.
+suno-deshimmer — removes AI generation noise floor (hiss/shimmer) from Suno songs.
 
 The artifact: a broadband noise floor that Suno's AI generation process bakes into
 the full mix — sounds like white noise / microphone hiss / static, present from the
@@ -19,14 +18,14 @@ Fallback (no instrumental): minimum-statistics noise floor estimation on mix alo
 
 Usage:
     python deshimmer.py song.wav --instrumental instr.mp3
-    python deshimmer.py song.wav --instrumental instr.mp3 --strength 0.85 --floor 0.80
+    python deshimmer.py song.wav --instrumental instr.mp3 --strength 0.425 --floor 0.90
     python deshimmer.py song.wav                           # fallback: min-stats only
 """
 
 import sys, os, argparse, tempfile, subprocess
 import numpy as np
 import soundfile as sf
-from scipy.signal import stft, istft, fftconvolve, butter, sosfiltfilt
+from scipy.signal import stft, istft
 
 
 # ── audio I/O ─────────────────────────────────────────────────────────────────
@@ -64,26 +63,22 @@ def noise_fingerprint_from_stem(mix, instr, sr, ref_seconds=4.0, n_fft=2048, hop
     n_ref = int(ref_seconds * sr)
     n_ref = min(n_ref, len(mix), len(instr))
 
-    # mono for alignment
     mx = mix[:n_ref].mean(axis=1)
     ix = instr[:n_ref].mean(axis=1)
 
-    # coarse alignment via cross-correlation (handles Suno's fixed export offset)
     corr   = np.correlate(mx, ix, mode='full')
     offset = int(np.argmax(np.abs(corr)) - (len(ix) - 1))
-    offset = np.clip(offset, -sr // 4, sr // 4)   # max ±0.25s search
+    offset = np.clip(offset, -sr // 4, sr // 4)
     if offset > 0:
         ix = np.pad(ix, (offset, 0))[:n_ref]
     elif offset < 0:
         ix = ix[-offset:]
         ix = np.pad(ix, (0, n_ref - len(ix)))
 
-    # noise = mix - instrumental, averaged across channels
     fingerprint = np.zeros(n_fft // 2 + 1, dtype=np.float64)
     count = 0
     for ch in range(mix.shape[1]):
         m = mix[:n_ref, ch]
-        # apply same offset to this channel's instrumental
         i_ch = instr[:n_ref, ch] if ch < instr.shape[1] else instr[:n_ref, 0]
         if offset > 0:
             i_ch = np.pad(i_ch, (offset, 0))[:n_ref]
@@ -118,7 +113,7 @@ def estimate_noise_floor(mag, window_frames=50):
 
 # ── deshimmer ─────────────────────────────────────────────────────────────────
 
-def deshimmer(song, sr, fingerprint=None, strength=0.85, floor=0.80,
+def deshimmer(song, sr, fingerprint=None, strength=0.425, floor=0.90,
               band_lo=500, n_fft=2048, hop=512, noise_window=50):
     """
     Subtract noise fingerprint from song.
@@ -135,7 +130,6 @@ def deshimmer(song, sr, fingerprint=None, strength=0.85, floor=0.80,
     out   = np.zeros_like(song)
     freqs = np.linspace(0, sr / 2, n_fft // 2 + 1)
 
-    # frequency mask with soft fade at band_lo boundary
     freq_mask = (freqs >= band_lo).astype(np.float32)
     lo_idx = np.searchsorted(freqs, band_lo)
     fade   = 10
@@ -151,10 +145,8 @@ def deshimmer(song, sr, fingerprint=None, strength=0.85, floor=0.80,
         phase = np.angle(S)
 
         if fingerprint is not None:
-            # fixed fingerprint: same profile subtracted from every frame
             subtraction = strength * fingerprint[:, None] * freq_mask[:, None]
         else:
-            # fallback: rolling minimum noise floor per frame
             noise_floor  = estimate_noise_floor(mag, window_frames=noise_window)
             subtraction  = strength * noise_floor * freq_mask[:, None]
 
@@ -167,91 +159,6 @@ def deshimmer(song, sr, fingerprint=None, strength=0.85, floor=0.80,
 
         rep = rep[:n] if len(rep) >= n else np.pad(rep, (0, n - len(rep)))
         out[:, ch] = rep.astype(np.float32)
-
-    return out
-
-
-# ── plate reverb IR + application ─────────────────────────────────────────────
-
-def make_plate_ir(sr, rt60=1.5, pre_delay_ms=20.0):
-    """
-    Synthetic plate reverb impulse response — smooth, dense, no resonant peaks.
-
-    Method:
-      1. Exponentially decaying Gaussian noise (dense, no discrete echoes)
-      2. Frequency-domain magnitude smoothing (kills spectral resonances)
-      3. Frequency shaping: HF rolloff at 7kHz (warmth), LF rolloff at 200Hz
-         (keeps kick/snare reverb imperceptible)
-      4. Pre-delay (separation between dry transient and reverb onset)
-
-    rt60         : reverberation time in seconds (time to decay 60 dB)
-    pre_delay_ms : delay before reverb onset in ms
-    """
-    from scipy.ndimage import uniform_filter1d
-
-    ir_len = int(rt60 * sr * 1.3)     # 30% extra for complete tail
-    t      = np.arange(ir_len) / sr
-
-    # dense Gaussian noise × exponential decay envelope
-    rng   = np.random.default_rng(42)
-    noise = rng.standard_normal(ir_len)
-    env   = np.exp(-6.908 * t / rt60)  # exactly -60 dB at rt60
-    ir    = noise * env
-
-    # short build-up (5ms) — avoids click at onset
-    build = int(0.005 * sr)
-    ir[:build] *= np.linspace(0, 1, build)
-
-    # frequency-domain smoothing — critical step: removes spectral resonances
-    # without this the reverb has a colored, resonant character
-    IR    = np.fft.rfft(ir)
-    mag   = np.abs(IR)
-    phase = np.angle(IR)
-    mag   = uniform_filter1d(mag, size=80)      # smooth over ~80 bins
-    mag   = uniform_filter1d(mag, size=80)      # second pass for extra smoothness
-    ir    = np.fft.irfft(mag * np.exp(1j * phase), n=ir_len)
-
-    # frequency shaping
-    # HF rolloff at 7kHz: warm tail, no metallic highs
-    sos_lp = butter(3, 7000 / (sr / 2), btype='low',  output='sos')
-    ir = sosfiltfilt(sos_lp, ir)
-    # LF rolloff at 200Hz: kick and bass stay dry
-    sos_hp = butter(3,  200 / (sr / 2), btype='high', output='sos')
-    ir = sosfiltfilt(sos_hp, ir)
-
-    # pre-delay
-    pre = int(pre_delay_ms / 1000 * sr)
-    ir  = np.pad(ir, (pre, 0))
-
-    # normalize to unit peak
-    ir /= np.abs(ir).max() + 1e-10
-    return ir.astype(np.float32)
-
-
-def add_reverb_tail(signal, sr, band_lo=500, rt60=1.5, pre_delay_ms=20.0, wet=0.10):
-    """
-    Apply plate reverb to the signal above band_lo Hz and mix at wet level.
-
-    Derives reverb only from frequencies above band_lo — kick/bass fundamentals
-    are excluded so their reverb contribution is inaudible at 10% wet.
-
-    wet=0.10 means 100% dry + 10% reverb, exactly as user described.
-    """
-    n   = len(signal)
-    ir  = make_plate_ir(sr, rt60=rt60, pre_delay_ms=pre_delay_ms)
-    sos = butter(4, band_lo / (sr / 2), btype='high', output='sos')
-    out = np.zeros_like(signal)
-
-    for ch in range(signal.shape[1]):
-        # reverb source: only high-passed signal (avoids kick/bass reverb)
-        src = sosfiltfilt(sos, signal[:, ch])
-        rev = fftconvolve(src, ir)[:n]
-        out[:, ch] = signal[:, ch] + wet * rev.astype(np.float32)
-
-    # safety clip
-    peak = np.abs(out).max()
-    if peak > 0.99:
-        out *= 0.99 / peak
 
     return out
 
@@ -291,20 +198,14 @@ def main():
     ap.add_argument("--out",            default=None)
     ap.add_argument("--ref-seconds",    type=float, default=4.0,
                     help="Seconds of pre-vocal audio to use for noise fingerprint (default 4.0)")
-    ap.add_argument("--strength",       type=float, default=0.85,
-                    help="Subtraction strength 0–1 (default 0.85)")
-    ap.add_argument("--floor",          type=float, default=0.80,
-                    help="Min magnitude floor as fraction of original (default 0.80)")
+    ap.add_argument("--strength",       type=float, default=0.425,
+                    help="Subtraction strength 0–1 (default 0.425)")
+    ap.add_argument("--floor",          type=float, default=0.90,
+                    help="Min magnitude floor as fraction of original (default 0.90)")
     ap.add_argument("--band-lo",        type=float, default=500,
                     help="Don't touch below this Hz (default 500)")
     ap.add_argument("--noise-window",   type=int,   default=50,
                     help="Fallback rolling minimum window in frames (default 50)")
-    ap.add_argument("--reverb-wet",     type=float, default=0.0,
-                    help="Reverb mix level 0–1 (default 0 = off; try 0.10 for vocal tracks)")
-    ap.add_argument("--reverb-time",    type=float, default=1.5,
-                    help="Reverb decay RT60 in seconds (default 1.5)")
-    ap.add_argument("--no-reverb",      action="store_true",
-                    help="Skip reverb restoration step")
     args = ap.parse_args()
 
     if not args.input:
@@ -348,13 +249,6 @@ def main():
                        floor=args.floor,
                        band_lo=args.band_lo,
                        noise_window=args.noise_window)
-
-    if not args.no_reverb and args.reverb_wet > 0:
-        print(f"  Adding plate reverb (wet={args.reverb_wet}  RT60={args.reverb_time}s  pre={20}ms)...")
-        result = add_reverb_tail(result, sr,
-                                 band_lo=args.band_lo,
-                                 rt60=args.reverb_time,
-                                 wet=args.reverb_wet)
 
     save(out_path, result, sr)
     print(f"\n  Original untouched : {args.input}")
