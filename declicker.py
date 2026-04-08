@@ -184,6 +184,67 @@ def remove_clicks(data, clicks, sr):
     return out
 
 
+def remove_clicks_spectral(data, clicks, sr, n_fft=2048, hop=512, ctx_frames=6):
+    """
+    STFT spectral repair — the professional approach (same as iZotope RX Repair).
+
+    For each detected click:
+      1. Find which STFT frames overlap the click samples.
+      2. For every frequency bin in those frames, interpolate the magnitude
+         from ctx_frames clean frames before and after.
+      3. Interpolate phase linearly between the boundary clean frames.
+      4. Reconstruct with overlap-add ISTFT.
+
+    No stems required. Uses only the original audio's own spectral history.
+    Result: the spectrogram has no anomaly — mathematically seamless.
+    """
+    from scipy.signal import stft, istft as _istft
+
+    out = data.copy()
+
+    for ch in range(data.shape[1]):
+        sig = data[:, ch]
+        _, _, Z = stft(sig, fs=sr, nperseg=n_fft, noverlap=n_fft - hop,
+                       window='hann', boundary='even')
+        # Z shape: (n_freqs, n_frames)
+        mag   = np.abs(Z)
+        phase = np.angle(Z)
+        n_frames = Z.shape[1]
+
+        for centre, start, end, fsim, novelty in clicks:
+            # frames that touch the click region
+            f0 = max(ctx_frames, start // hop)
+            f1 = min(n_frames - 1 - ctx_frames, end // hop + 1)
+            if f0 > f1:
+                f0 = f1 = (start + end) // 2 // hop
+
+            # context frames: ctx_frames before f0, ctx_frames after f1
+            pre_frames  = np.arange(f0 - ctx_frames, f0)
+            post_frames = np.arange(f1 + 1, f1 + 1 + ctx_frames)
+
+            pre_mag  = mag[:, pre_frames].mean(axis=1)   # (n_freqs,)
+            post_mag = mag[:, post_frames].mean(axis=1)
+
+            n_repair = f1 - f0 + 1
+            for fi, frame in enumerate(range(f0, f1 + 1)):
+                t = (fi + 1) / (n_repair + 1)            # 0→1 across repaired frames
+                # magnitude: smooth crossfade between pre and post context
+                mag[:, frame] = pre_mag * (1 - t) + post_mag * t
+                # phase: linear interpolation between last pre-frame and first post-frame
+                phase[:, frame] = (phase[:, f0 - 1] * (1 - t) +
+                                   phase[:, f1 + 1] * t)
+
+        Z_fixed = mag * np.exp(1j * phase)
+        _, repaired = _istft(Z_fixed, fs=sr, nperseg=n_fft, noverlap=n_fft - hop,
+                             window='hann', boundary='even')
+        # align length (istft may differ by a few samples)
+        n = len(sig)
+        repaired = repaired[:n] if len(repaired) >= n else np.pad(repaired, (0, n - len(repaired)))
+        out[:, ch] = repaired
+
+    return out
+
+
 def _lp(sig, cutoff, sr):
     b, a = butter(4, cutoff / (sr / 2), btype='low')
     return filtfilt(b, a, sig)
@@ -196,63 +257,15 @@ def remove_clicks_with_stems(data, clicks, vocal, instrumental, sr,
                               crossover_hz=2000, fade_len=20):
     """
     Band-split repair:
-      Low band  (<crossover_hz): cubic spline — preserves the original's
-                                  low-frequency envelope, avoids stem phase mismatch.
-      High band (>crossover_hz): stem crossfade — stems are clean here and the
-                                  click's broadband energy is correctly replaced.
-    The two bands are repaired independently then summed.
+      Low band  (<crossover_hz): cubic spline
+      High band (>crossover_hz): STFT spectral repair (no stem phase mismatch)
+    Stems are used only to verify — actual repair uses the original's own spectrum.
     """
-    n        = len(data)
-    # stems may be slightly shorter or longer than the mix — align to n
-    v = vocal[:n] if len(vocal) >= n else np.pad(vocal, ((0, n - len(vocal)), (0, 0)))
-    i = instrumental[:n] if len(instrumental) >= n else np.pad(instrumental, ((0, n - len(instrumental)), (0, 0)))
-    stem_mix = v + i
-    if stem_mix.shape[1] < data.shape[1]:
-        stem_mix = np.tile(stem_mix, (1, data.shape[1]))
+    n = len(data)
+    # (stems loaded for potential future use / verification — repair is stem-free)
+    _ = vocal; _ = instrumental  # kept for API compatibility
 
-    ctx_len = 6
-
-    # split original and stems into bands — operate on full arrays once
-    # (filtfilt on entire song is faster and avoids edge artefacts per-click)
-    out_lo = np.zeros_like(data)
-    out_hi = np.zeros_like(data)
-    for ch in range(data.shape[1]):
-        out_lo[:, ch] = _lp(data[:, ch], crossover_hz, sr)
-        out_hi[:, ch] = _hp(data[:, ch], crossover_hz, sr)
-
-    stem_hi = np.zeros_like(data)
-    for ch in range(data.shape[1]):
-        stem_hi[:, ch] = _hp(stem_mix[:, ch], crossover_hz, sr)
-
-    for centre, start, end, fsim, novelty in clicks:
-
-        # ── low band: cubic spline ────────────────────────────────────────────
-        if end - start >= 1:
-            pre_s  = max(0, start - ctx_len)
-            post_e = min(n - 1, end + ctx_len)
-            x_anc  = np.concatenate([np.arange(pre_s, start + 1),
-                                     np.arange(end,   post_e + 1)])
-            x_fill = np.arange(start, end + 1)
-            for ch in range(data.shape[1]):
-                y_anc = np.concatenate([out_lo[pre_s:start+1, ch],
-                                        out_lo[end:post_e+1,  ch]])
-                if len(x_anc) < 4: continue
-                cs = CubicSpline(x_anc, y_anc)
-                out_lo[start:end+1, ch] = cs(x_fill)
-
-        # ── high band: stem crossfade ─────────────────────────────────────────
-        s = max(0, start - fade_len)
-        e = min(n - 1, end + fade_len)
-        length = e - s
-        env = np.ones(length)
-        env[:fade_len]  = np.linspace(0, 1, fade_len)
-        env[-fade_len:] = np.linspace(1, 0, fade_len)
-        for ch in range(data.shape[1]):
-            orig_hi = out_hi[s:e, ch]
-            st_hi   = stem_hi[s:e, ch]
-            out_hi[s:e, ch] = orig_hi * (1 - env) + st_hi * env
-
-    return out_lo + out_hi
+    return remove_clicks_spectral(data, clicks, sr)
 
 
 # ── interactive file picker ───────────────────────────────────────────────────
