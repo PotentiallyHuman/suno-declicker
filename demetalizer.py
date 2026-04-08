@@ -82,31 +82,65 @@ def reverb_fingerprint(wet, dry, sr, n_fft=2048, hop=512):
     return fingerprint
 
 
+# ── reverb presence envelope ──────────────────────────────────────────────────
+
+def reverb_envelope(wet, dry, sr, n_fft=2048, hop=512, smooth_frames=8):
+    """
+    Returns a 1D array (n_frames,) in range [0, 1]:
+      1.0 = this frame is pure reverb tail (dry is silent, wet still rings)
+      0.0 = active singing present (dry has energy, reverb is masked)
+
+    This becomes the per-frame sidechain that controls how hard we filter.
+    When the singer is present the reverb is masked and we leave it alone.
+    When only reverb tail is ringing with no new vocal, we suppress hard.
+    """
+    dry = align(wet, dry)
+    wet_energy = np.zeros(1, dtype=np.float32)
+    dry_energy = np.zeros(1, dtype=np.float32)
+
+    for ch in range(wet.shape[1]):
+        _, _, W = stft(wet[:, ch], fs=sr, nperseg=n_fft,
+                       noverlap=n_fft - hop, window='hann', boundary='even')
+        _, _, D = stft(dry[:, ch], fs=sr, nperseg=n_fft,
+                       noverlap=n_fft - hop, window='hann', boundary='even')
+        we = np.abs(W).mean(axis=0).astype(np.float32)  # energy per frame
+        de = np.abs(D).mean(axis=0).astype(np.float32)
+        if wet_energy.shape != we.shape:
+            wet_energy = we.copy()
+            dry_energy = de.copy()
+        else:
+            wet_energy += we
+            dry_energy += de
+
+    wet_energy /= wet.shape[1]
+    dry_energy /= wet.shape[1]
+
+    # ratio: how much of wet energy is BEYOND dry (i.e. pure reverb tail)
+    # 1 when dry is silent, 0 when dry ≈ wet
+    ratio = np.clip(1.0 - dry_energy / (wet_energy + 1e-10), 0.0, 1.0)
+
+    # smooth to avoid abrupt filter changes (creates pumping)
+    ratio = uniform_filter1d(ratio, size=smooth_frames)
+    return ratio
+
+
 # ── full-song subtraction ──────────────────────────────────────────────────────
 
-def demetalize(song, fingerprint, sr, strength=0.4, floor=0.6,
-               instrumental=None, reinforce=0.3, n_fft=2048, hop=512):
+def demetalize(song, fingerprint, envelope, sr, strength=0.8,
+               floor=0.85, n_fft=2048, hop=512):
     """
-    Subtract the reverb fingerprint from the full song.
+    Subtract the reverb fingerprint from the full song, modulated per frame
+    by the reverb envelope (sidechain):
+      - envelope[t] ≈ 1 → pure reverb tail → subtract at full strength
+      - envelope[t] ≈ 0 → singer present → barely subtract (reverb is masked)
 
-    strength:   how much of the fingerprint to subtract (0.0–1.0)
-    floor:      minimum magnitude as a fraction of original (0.6 = never below 60%)
-                — this is the main knob that preserves depth
-    instrumental: if provided, blend back its energy at subtracted frequencies
-    reinforce:  how much instrumental to blend in to compensate for lost depth
+    floor: minimum magnitude as fraction of original — prevents hollowing
+    strength: maximum subtraction intensity when envelope=1
     """
-    n = len(song)
-    out = np.zeros_like(song)
-
-    # pre-compute instrumental STFT if provided
-    instr_mag = {}
-    if instrumental is not None:
-        instr_a = align(song, instrumental)
-        for ch in range(song.shape[1]):
-            ich = min(ch, instr_a.shape[1] - 1)
-            _, _, I = stft(instr_a[:, ich], fs=sr, nperseg=n_fft,
-                           noverlap=n_fft - hop, window='hann', boundary='even')
-            instr_mag[ch] = np.abs(I)
+    n          = len(song)
+    out        = np.zeros_like(song)
+    # envelope is (n_frames,) — broadcast over frequency axis
+    env        = envelope.astype(np.float32)
 
     for ch in range(song.shape[1]):
         _, _, S = stft(song[:, ch], fs=sr, nperseg=n_fft,
@@ -114,19 +148,20 @@ def demetalize(song, fingerprint, sr, strength=0.4, floor=0.6,
         mag   = np.abs(S)
         phase = np.angle(S)
 
-        # how much we subtract per bin — fingerprint scaled by strength
-        subtraction = strength * fingerprint[:, None]
+        # align envelope length to STFT frame count
+        n_frames = mag.shape[1]
+        if len(env) >= n_frames:
+            env_t = env[:n_frames]
+        else:
+            env_t = np.pad(env, (0, n_frames - len(env)))
 
-        # floor: never reduce a bin below this fraction of its original magnitude
-        hard_floor = mag * floor
+        # per-frame subtraction: fingerprint × strength × reverb_envelope
+        # when envelope≈0 (singer present) → barely subtract
+        # when envelope≈1 (pure reverb tail) → subtract at full strength
+        subtraction = strength * fingerprint[:, None] * env_t[None, :]
 
-        mag_clean = np.maximum(mag - subtraction, hard_floor)
-
-        # reinforce: at frequencies where we subtracted most, blend in instrumental
-        if instrumental is not None:
-            # how much was actually removed (0 = nothing, 1 = a lot relative to original)
-            removed_ratio = (mag - mag_clean) / (mag + 1e-10)
-            mag_clean += reinforce * removed_ratio * instr_mag[ch]
+        hard_floor  = mag * floor
+        mag_clean   = np.maximum(mag - subtraction, hard_floor)
 
         Z_clean = mag_clean * np.exp(1j * phase)
         _, repaired = istft(Z_clean, fs=sr, nperseg=n_fft,
@@ -194,14 +229,11 @@ def main():
     ap.add_argument("input",     nargs="?", default=None, help="Full song mix")
     ap.add_argument("--wet",     default=None, help="Wet vocal stem (with effects)")
     ap.add_argument("--dry",     default=None, help="Dry vocal stem (no effects)")
-    ap.add_argument("--out",          default=None, help="Output path (default: <input>_demetalized.wav)")
-    ap.add_argument("--instrumental", default=None, help="Instrumental stem — used to reinforce depth after subtraction")
-    ap.add_argument("--strength",  type=float, default=0.4,
-                    help="Subtraction strength 0.0–1.0 (default 0.4)")
-    ap.add_argument("--floor",     type=float, default=0.6,
-                    help="Min magnitude floor as fraction of original (default 0.6 — preserves depth)")
-    ap.add_argument("--reinforce", type=float, default=0.3,
-                    help="How much instrumental to blend back at subtracted frequencies (default 0.3)")
+    ap.add_argument("--out",      default=None, help="Output path (default: <input>_demetalized.wav)")
+    ap.add_argument("--strength", type=float, default=0.8,
+                    help="Max subtraction strength during reverb-only frames (default 0.8)")
+    ap.add_argument("--floor",    type=float, default=0.85,
+                    help="Min magnitude floor as fraction of original (default 0.85)")
     args = ap.parse_args()
 
     if not args.input or not args.wet or not args.dry:
@@ -222,26 +254,25 @@ def main():
     print(f"  Full song : {os.path.basename(args.input)}")
     print(f"  Wet vocal : {os.path.basename(args.wet)}")
     print(f"  Dry vocal : {os.path.basename(args.dry)}")
-    print(f"  Strength  : {args.strength}  floor={args.floor}  reinforce={args.reinforce}")
+    print(f"  Strength  : {args.strength}  floor={args.floor}")
     print(f"  Output    : {os.path.basename(out_path)}\n")
 
     song, sr = load(args.input)
     wet,  _  = load(args.wet)
     dry,  _  = load(args.dry)
-    instr    = None
-    if args.instrumental:
-        instr, _ = load(args.instrumental)
-        print(f"  Instrumental loaded for depth reinforcement")
     print(f"  {sr} Hz | {song.shape[1]}ch | {len(song)/sr:.1f}s")
 
     print("  Building reverb fingerprint from wet/dry vocal comparison...")
-    fp = reverb_fingerprint(wet, dry, sr)
-    print(f"  Peak reverb frequency: {np.argmax(fp) * sr / 2048:.0f} Hz")
+    fp  = reverb_fingerprint(wet, dry, sr)
+    print(f"  Peak metallic frequency : {np.argmax(fp) * sr / 2048:.0f} Hz")
 
-    print("  Subtracting reverb fingerprint from full song...")
-    result = demetalize(song, fp, sr,
-                        strength=args.strength, floor=args.floor,
-                        instrumental=instr, reinforce=args.reinforce)
+    print("  Computing reverb presence envelope (sidechain)...")
+    env = reverb_envelope(wet, dry, sr)
+    print(f"  Reverb-only frames      : {(env > 0.5).sum()} / {len(env)}  ({100*(env>0.5).mean():.1f}% of song)")
+
+    print("  Subtracting (only during reverb-tail frames)...")
+    result = demetalize(song, fp, env, sr,
+                        strength=args.strength, floor=args.floor)
 
     save(out_path, result, sr)
     print(f"\n  Original untouched : {args.input}")
