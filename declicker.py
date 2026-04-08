@@ -193,12 +193,33 @@ def repair_band(band_data, clicks, sr, n_fft=2048, hop=512, ctx_frames=6):
 def remove_clicks_spectral(data, clicks, sr):
     """
     Split into 6 perceptual bands → repair each independently → recombine.
-    Narrower band signal = more accurate STFT magnitude interpolation.
+    Then blend repaired back into the original using a click mask, so the
+    filterbank coloration only affects click regions (not the whole song).
     """
     if not clicks: return data
     bands    = split_bands(data, sr)
     repaired = [repair_band(b, clicks, sr) for b in bands]
-    return merge_bands(repaired)
+    combined = merge_bands(repaired)
+
+    # build a sample-level mask: 1 at clicks, 0 elsewhere, with short crossfade
+    n    = len(data)
+    mask = np.zeros(n, dtype=np.float32)
+    fade = int(0.005 * sr)  # 5ms crossfade each side
+    for _, start, end, _ in clicks:
+        s = max(0, start - fade)
+        e = min(n, end   + fade)
+        mask[s:e] = 1.0
+        # cosine fade-in
+        fade_in_len = min(fade, start - s)
+        if fade_in_len > 0:
+            mask[s:s+fade_in_len] = (1 - np.cos(np.pi * np.arange(fade_in_len) / fade_in_len)) / 2
+        # cosine fade-out
+        fade_out_len = min(fade, e - end)
+        if fade_out_len > 0:
+            mask[end:end+fade_out_len] = (1 + np.cos(np.pi * np.arange(fade_out_len) / fade_out_len)) / 2
+
+    mask = mask[:, None]  # broadcast over channels
+    return data * (1 - mask) + combined * mask
 
 
 # ── interactive file picker ───────────────────────────────────────────────────
