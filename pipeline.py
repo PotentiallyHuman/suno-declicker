@@ -2,20 +2,16 @@
 suno-pipeline — full enhancement pipeline for Suno AI generated songs.
 
 Steps:
-  1. Declicker      — remove broadband click/tick artifacts
-  2. Demetalizer    — subtract metallic reverb fingerprint (wet vs dry vocal)
-  3. Polish         — normalize to -14 LUFS (streaming standard), gentle high-shelf
-                      to restore any air lost in demetalizing
+  1. Declicker  — remove broadband click/tick artifacts (STFT spectral repair)
+  2. Polish     — normalize to -14 LUFS (streaming standard)
 
-Inputs (all from Suno):
-  • Full song mix
-  • Wet vocal stem  (with Suno effects)
-  • Dry vocal stem  (no effects, from Suno Studio)
-  • Instrumental stem
+Note: the demetalizer is NOT applied to the full mix here — applying a vocal
+reverb fingerprint to drums and bass damages transients and muddies low end.
+Run demetalizer.py separately on the vocal stem only if needed.
 
 Usage:
-    python pipeline.py                          # interactive
-    python pipeline.py song.mp3 --wet v_fx.mp3 --dry v_raw.mp3 --instrumental inst.mp3
+    python pipeline.py                    # interactive
+    python pipeline.py song.mp3 --wet vocal_fx.mp3 --dry vocal_raw.mp3
 """
 
 import sys, os, argparse, tempfile, subprocess
@@ -26,8 +22,7 @@ from scipy.ndimage import uniform_filter1d
 
 # ── import shared functions from sibling scripts ───────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
-from declicker    import load, save, detect_clicks, remove_clicks_spectral
-from demetalizer  import reverb_fingerprint, align
+from declicker import load, save, detect_clicks, remove_clicks_spectral
 
 
 # ── demetalizer (clean, no instrumental replacement) ──────────────────────────
@@ -161,22 +156,16 @@ def interactive_setup():
 
 def main():
     ap = argparse.ArgumentParser(description="Full Suno enhancement pipeline.")
-    ap.add_argument("input",          nargs="?", default=None)
-    ap.add_argument("--wet",          default=None)
-    ap.add_argument("--dry",          default=None)
-    ap.add_argument("--instrumental", default=None)
-    ap.add_argument("--out",          default=None)
-    ap.add_argument("--threshold",    type=float, default=5.0)
-    ap.add_argument("--similarity",   type=float, default=0.70)
-    ap.add_argument("--dm-strength",  type=float, default=0.35,
-                    help="Demetalizer subtraction strength (default 0.35)")
-    ap.add_argument("--dm-floor",     type=float, default=0.75,
-                    help="Demetalizer floor — min fraction of original magnitude (default 0.75)")
-    ap.add_argument("--target-lufs",  type=float, default=-14.0)
+    ap.add_argument("input",         nargs="?", default=None)
+    ap.add_argument("--out",         default=None)
+    ap.add_argument("--threshold",   type=float, default=5.0)
+    ap.add_argument("--similarity",  type=float, default=0.70)
+    ap.add_argument("--target-lufs", type=float, default=-14.0)
     args = ap.parse_args()
 
     if not args.input:
-        args.input, args.wet, args.dry, args.instrumental = interactive_setup()
+        files = list_audio_files()
+        args.input = pick_file("Select the FULL SONG mix:", files)
 
     out_path = args.out or (os.path.splitext(args.input)[0] + "_enhanced.wav")
 
@@ -187,29 +176,18 @@ def main():
     print(f"  Output   : {os.path.basename(out_path)}\n")
 
     song, sr = load(args.input)
-    wet,  _  = load(args.wet)
-    dry,  _  = load(args.dry)
     print(f"  {sr} Hz | {song.shape[1]}ch | {len(song)/sr:.1f}s\n")
 
     # ── step 1: declicker ────────────────────────────────────────────────────
-    print("  [1/3] Declicker — scanning for artifacts...")
+    print("  [1/2] Declicker — scanning for artifacts...")
     clicks = detect_clicks(song, sr, args.threshold, args.similarity)
     print(f"        Found {len(clicks)} click(s) — repairing with STFT spectral repair...")
     song = remove_clicks_spectral(song, clicks, sr)
     print(f"        Done.\n")
 
-    # ── step 2: demetalizer ──────────────────────────────────────────────────
-    print("  [2/3] Demetalizer — building reverb fingerprint...")
-    fp = reverb_fingerprint(wet, dry, sr)
-    peak_hz = np.argmax(fp) * sr / 2048
-    print(f"        Peak metallic frequency: {peak_hz:.0f} Hz")
-    print(f"        Subtracting (strength={args.dm_strength}, floor={args.dm_floor})...")
-    song = demetalize(song, fp, sr, strength=args.dm_strength, floor=args.dm_floor)
-    print(f"        Done.\n")
-
-    # ── step 3: polish ───────────────────────────────────────────────────────
-    print("  [3/3] Polish — loudness normalization + high shelf...")
-    song = polish(song, sr, target_lufs=args.target_lufs)
+    # ── step 2: polish ───────────────────────────────────────────────────────
+    print("  [2/2] Polish — loudness normalization...")
+    song = polish(song, sr, target_lufs=args.target_lufs, shelf_db=0)
     print(f"        Done.\n")
 
     save(out_path, song, sr)
