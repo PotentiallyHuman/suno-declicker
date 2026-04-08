@@ -203,7 +203,10 @@ def remove_clicks_with_stems(data, clicks, vocal, instrumental, sr,
     The two bands are repaired independently then summed.
     """
     n        = len(data)
-    stem_mix = (vocal[:n] + instrumental[:n])
+    # stems may be slightly shorter or longer than the mix — align to n
+    v = vocal[:n] if len(vocal) >= n else np.pad(vocal, ((0, n - len(vocal)), (0, 0)))
+    i = instrumental[:n] if len(instrumental) >= n else np.pad(instrumental, ((0, n - len(instrumental)), (0, 0)))
+    stem_mix = v + i
     if stem_mix.shape[1] < data.shape[1]:
         stem_mix = np.tile(stem_mix, (1, data.shape[1]))
 
