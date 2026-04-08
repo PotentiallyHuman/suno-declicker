@@ -127,20 +127,34 @@ def reverb_envelope(wet, dry, sr, n_fft=2048, hop=512, smooth_frames=8):
 # ── full-song subtraction ──────────────────────────────────────────────────────
 
 def demetalize(song, fingerprint, envelope, sr, strength=0.8,
-               floor=0.85, n_fft=2048, hop=512):
+               floor=0.85, band_lo=2000, band_hi=8000, n_fft=2048, hop=512):
     """
-    Subtract the reverb fingerprint from the full song, modulated per frame
-    by the reverb envelope (sidechain):
-      - envelope[t] ≈ 1 → pure reverb tail → subtract at full strength
-      - envelope[t] ≈ 0 → singer present → barely subtract (reverb is masked)
+    Subband + sidechain spectral subtraction.
 
-    floor: minimum magnitude as fraction of original — prevents hollowing
-    strength: maximum subtraction intensity when envelope=1
+    Two axes of control:
+      Frequency axis: only process band_lo–band_hi Hz (default 2–8kHz).
+                      Everything below (kick, bass, body) and above (air) is untouched.
+      Time axis:      envelope gates the strength per frame — only suppress
+                      during reverb-tail frames when the singer is absent.
+
+    This is the subband approach: the metallic resonance lives in 2–8kHz.
+    Isolate it, fix it, leave the rest of the spectrum completely alone.
     """
-    n          = len(song)
-    out        = np.zeros_like(song)
-    # envelope is (n_frames,) — broadcast over frequency axis
-    env        = envelope.astype(np.float32)
+    n     = len(song)
+    out   = np.zeros_like(song)
+    env   = envelope.astype(np.float32)
+    freqs = np.linspace(0, sr / 2, n_fft // 2 + 1)
+
+    # frequency mask: 1 inside the metallic band, 0 everywhere else
+    freq_mask = ((freqs >= band_lo) & (freqs <= band_hi)).astype(np.float32)
+    # soft edges — 10-bin cosine fade to avoid ringing artifacts at band boundaries
+    fade = 10
+    lo_idx = np.searchsorted(freqs, band_lo)
+    hi_idx = np.searchsorted(freqs, band_hi)
+    for i in range(fade):
+        t = (i + 1) / (fade + 1)
+        if lo_idx + i < len(freq_mask): freq_mask[lo_idx - fade + i] *= t
+        if hi_idx - i - 1 >= 0:        freq_mask[hi_idx - i] *= t
 
     for ch in range(song.shape[1]):
         _, _, S = stft(song[:, ch], fs=sr, nperseg=n_fft,
@@ -148,20 +162,17 @@ def demetalize(song, fingerprint, envelope, sr, strength=0.8,
         mag   = np.abs(S)
         phase = np.angle(S)
 
-        # align envelope length to STFT frame count
         n_frames = mag.shape[1]
-        if len(env) >= n_frames:
-            env_t = env[:n_frames]
-        else:
-            env_t = np.pad(env, (0, n_frames - len(env)))
+        env_t = env[:n_frames] if len(env) >= n_frames else np.pad(env, (0, n_frames - len(env)))
 
-        # per-frame subtraction: fingerprint × strength × reverb_envelope
-        # when envelope≈0 (singer present) → barely subtract
-        # when envelope≈1 (pure reverb tail) → subtract at full strength
-        subtraction = strength * fingerprint[:, None] * env_t[None, :]
+        # subtraction applies only within the frequency band AND during reverb tail
+        subtraction = (strength
+                       * fingerprint[:, None]   # (n_freqs, 1)
+                       * freq_mask[:, None]      # (n_freqs, 1) — zero outside band
+                       * env_t[None, :])         # (1, n_frames) — zero when singing
 
-        hard_floor  = mag * floor
-        mag_clean   = np.maximum(mag - subtraction, hard_floor)
+        hard_floor = mag * floor
+        mag_clean  = np.maximum(mag - subtraction, hard_floor)
 
         Z_clean = mag_clean * np.exp(1j * phase)
         _, repaired = istft(Z_clean, fs=sr, nperseg=n_fft,
@@ -230,10 +241,14 @@ def main():
     ap.add_argument("--wet",     default=None, help="Wet vocal stem (with effects)")
     ap.add_argument("--dry",     default=None, help="Dry vocal stem (no effects)")
     ap.add_argument("--out",      default=None, help="Output path (default: <input>_demetalized.wav)")
-    ap.add_argument("--strength", type=float, default=0.8,
+    ap.add_argument("--strength",  type=float, default=0.8,
                     help="Max subtraction strength during reverb-only frames (default 0.8)")
-    ap.add_argument("--floor",    type=float, default=0.85,
+    ap.add_argument("--floor",     type=float, default=0.85,
                     help="Min magnitude floor as fraction of original (default 0.85)")
+    ap.add_argument("--band-lo",   type=float, default=2000,
+                    help="Low edge of metallic band in Hz (default 2000)")
+    ap.add_argument("--band-hi",   type=float, default=8000,
+                    help="High edge of metallic band in Hz (default 8000)")
     args = ap.parse_args()
 
     if not args.input or not args.wet or not args.dry:
@@ -270,9 +285,10 @@ def main():
     env = reverb_envelope(wet, dry, sr)
     print(f"  Reverb-only frames      : {(env > 0.5).sum()} / {len(env)}  ({100*(env>0.5).mean():.1f}% of song)")
 
-    print("  Subtracting (only during reverb-tail frames)...")
+    print(f"  Subtracting in {args.band_lo:.0f}–{args.band_hi:.0f} Hz only (reverb-tail frames)...")
     result = demetalize(song, fp, env, sr,
-                        strength=args.strength, floor=args.floor)
+                        strength=args.strength, floor=args.floor,
+                        band_lo=args.band_lo, band_hi=args.band_hi)
 
     save(out_path, result, sr)
     print(f"\n  Original untouched : {args.input}")
