@@ -84,33 +84,54 @@ def reverb_fingerprint(wet, dry, sr, n_fft=2048, hop=512):
 
 # ── full-song subtraction ──────────────────────────────────────────────────────
 
-def demetalize(song, fingerprint, sr, strength=0.8, n_fft=2048, hop=512):
+def demetalize(song, fingerprint, sr, strength=0.4, floor=0.6,
+               instrumental=None, reinforce=0.3, n_fft=2048, hop=512):
     """
-    Subtract the reverb fingerprint from the full song mix using spectral subtraction.
+    Subtract the reverb fingerprint from the full song.
 
-    strength: 0.0 = no change, 1.0 = full fingerprint subtracted.
-    Uses over-subtraction with flooring to avoid musical noise artifacts.
+    strength:   how much of the fingerprint to subtract (0.0–1.0)
+    floor:      minimum magnitude as a fraction of original (0.6 = never below 60%)
+                — this is the main knob that preserves depth
+    instrumental: if provided, blend back its energy at subtracted frequencies
+    reinforce:  how much instrumental to blend in to compensate for lost depth
     """
+    n = len(song)
     out = np.zeros_like(song)
+
+    # pre-compute instrumental STFT if provided
+    instr_mag = {}
+    if instrumental is not None:
+        instr_a = align(song, instrumental)
+        for ch in range(song.shape[1]):
+            ich = min(ch, instr_a.shape[1] - 1)
+            _, _, I = stft(instr_a[:, ich], fs=sr, nperseg=n_fft,
+                           noverlap=n_fft - hop, window='hann', boundary='even')
+            instr_mag[ch] = np.abs(I)
 
     for ch in range(song.shape[1]):
         _, _, S = stft(song[:, ch], fs=sr, nperseg=n_fft,
                        noverlap=n_fft - hop, window='hann', boundary='even')
-
         mag   = np.abs(S)
         phase = np.angle(S)
 
-        # spectral subtraction: remove the reverb fingerprint energy from each frame.
-        # floor at a small fraction of the original to avoid zeroing out real signal.
-        subtracted = mag - strength * fingerprint[:, None]
-        floor      = mag * 0.05   # never go below 5% of original magnitude
-        mag_clean  = np.maximum(subtracted, floor)
+        # how much we subtract per bin — fingerprint scaled by strength
+        subtraction = strength * fingerprint[:, None]
+
+        # floor: never reduce a bin below this fraction of its original magnitude
+        hard_floor = mag * floor
+
+        mag_clean = np.maximum(mag - subtraction, hard_floor)
+
+        # reinforce: at frequencies where we subtracted most, blend in instrumental
+        if instrumental is not None:
+            # how much was actually removed (0 = nothing, 1 = a lot relative to original)
+            removed_ratio = (mag - mag_clean) / (mag + 1e-10)
+            mag_clean += reinforce * removed_ratio * instr_mag[ch]
 
         Z_clean = mag_clean * np.exp(1j * phase)
         _, repaired = istft(Z_clean, fs=sr, nperseg=n_fft,
                             noverlap=n_fft - hop, window='hann', boundary='even')
 
-        n = len(song)
         repaired = repaired[:n] if len(repaired) >= n else np.pad(repaired, (0, n - len(repaired)))
         out[:, ch] = repaired
 
@@ -173,9 +194,14 @@ def main():
     ap.add_argument("input",     nargs="?", default=None, help="Full song mix")
     ap.add_argument("--wet",     default=None, help="Wet vocal stem (with effects)")
     ap.add_argument("--dry",     default=None, help="Dry vocal stem (no effects)")
-    ap.add_argument("--out",     default=None, help="Output path (default: <input>_demetalized.wav)")
-    ap.add_argument("--strength", type=float, default=0.8,
-                    help="Subtraction strength 0.0–1.0 (default 0.8)")
+    ap.add_argument("--out",          default=None, help="Output path (default: <input>_demetalized.wav)")
+    ap.add_argument("--instrumental", default=None, help="Instrumental stem — used to reinforce depth after subtraction")
+    ap.add_argument("--strength",  type=float, default=0.4,
+                    help="Subtraction strength 0.0–1.0 (default 0.4)")
+    ap.add_argument("--floor",     type=float, default=0.6,
+                    help="Min magnitude floor as fraction of original (default 0.6 — preserves depth)")
+    ap.add_argument("--reinforce", type=float, default=0.3,
+                    help="How much instrumental to blend back at subtracted frequencies (default 0.3)")
     args = ap.parse_args()
 
     if not args.input or not args.wet or not args.dry:
@@ -196,12 +222,16 @@ def main():
     print(f"  Full song : {os.path.basename(args.input)}")
     print(f"  Wet vocal : {os.path.basename(args.wet)}")
     print(f"  Dry vocal : {os.path.basename(args.dry)}")
-    print(f"  Strength  : {args.strength}")
+    print(f"  Strength  : {args.strength}  floor={args.floor}  reinforce={args.reinforce}")
     print(f"  Output    : {os.path.basename(out_path)}\n")
 
     song, sr = load(args.input)
     wet,  _  = load(args.wet)
     dry,  _  = load(args.dry)
+    instr    = None
+    if args.instrumental:
+        instr, _ = load(args.instrumental)
+        print(f"  Instrumental loaded for depth reinforcement")
     print(f"  {sr} Hz | {song.shape[1]}ch | {len(song)/sr:.1f}s")
 
     print("  Building reverb fingerprint from wet/dry vocal comparison...")
@@ -209,7 +239,9 @@ def main():
     print(f"  Peak reverb frequency: {np.argmax(fp) * sr / 2048:.0f} Hz")
 
     print("  Subtracting reverb fingerprint from full song...")
-    result = demetalize(song, fp, sr, strength=args.strength)
+    result = demetalize(song, fp, sr,
+                        strength=args.strength, floor=args.floor,
+                        instrumental=instr, reinforce=args.reinforce)
 
     save(out_path, result, sr)
     print(f"\n  Original untouched : {args.input}")
