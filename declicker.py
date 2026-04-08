@@ -19,10 +19,10 @@ Usage:
 import sys, os, argparse, tempfile, subprocess
 import numpy as np
 import soundfile as sf
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import uniform_filter1d, median_filter
 from scipy.fft import rfft
 from scipy.interpolate import CubicSpline
-from scipy.signal import butter, sosfilt, stft, istft
+from scipy.signal import butter, sosfilt, stft, istft, correlate
 
 # ── Suno click fingerprint ────────────────────────────────────────────────────
 SUNO_CLICK_FINGERPRINT = np.array([
@@ -44,6 +44,85 @@ SUNO_CLICK_FINGERPRINT = np.array([
 ], dtype=np.float32)
 
 FINGERPRINT_WIN = 256
+
+
+# ── stem warp alignment ───────────────────────────────────────────────────────
+
+def build_stem_warp(mix_mono, dry_mono, sr):
+    """
+    Use WhisperX phoneme timestamps from the dry stem as anchor points,
+    then cross-correlate each anchor in the mix to get precise mix positions.
+    Returns a (mix_times, stem_times) pair for use with np.interp.
+    Suno stems drift up to 500ms over a 4-min song.
+    """
+    try:
+        import whisperx
+    except ImportError:
+        print("  [warp] whisperx not installed — stem alignment skipped")
+        return None, None
+
+    tmp = tempfile.mktemp(suffix=".wav")
+    sf.write(tmp, dry_mono, sr)
+    try:
+        device = "cpu"
+        model  = whisperx.load_model("base", device, compute_type="float32")
+        audio  = whisperx.load_audio(tmp)
+        result = model.transcribe(audio, batch_size=4, language="en")
+        ma, meta = whisperx.load_align_model(language_code="en", device=device)
+        result   = whisperx.align(result["segments"], ma, meta, audio, device)
+        words    = [w for w in result["word_segments"]
+                    if "start" in w and "end" in w and w["end"] > w["start"]]
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+    n      = min(len(mix_mono), len(dry_mono))
+    search = int(0.5 * sr)
+    pairs  = []
+
+    for w in words:
+        stem_mid = (w["start"] + w["end"]) / 2
+        seg_len  = max(int((w["end"] - w["start"]) * sr), int(0.08 * sr))
+        s_dry    = int(w["start"] * sr)
+        e_dry    = min(n, s_dry + seg_len)
+        seg_dry  = dry_mono[s_dry:e_dry]
+        if len(seg_dry) < 256: continue
+
+        exp_mix  = int(stem_mid * sr)
+        s_mix    = max(0, exp_mix - search - seg_len)
+        e_mix    = min(n, exp_mix + search + seg_len)
+        seg_mix  = mix_mono[s_mix:e_mix]
+        if len(seg_mix) < len(seg_dry): continue
+
+        cc       = correlate(seg_mix, seg_dry, mode='valid')
+        offset   = cc.argmax()
+        mix_mid  = (s_mix + offset + len(seg_dry) // 2) / sr
+        pairs.append((stem_mid, mix_mid))
+
+    if len(pairs) < 10:
+        return None, None
+
+    pairs      = np.array(pairs)
+    stem_t     = pairs[:, 0]
+    mix_t      = pairs[:, 1]
+    drift      = (stem_t - mix_t) * 1000
+
+    # reject outliers vs sliding median
+    idx        = np.argsort(stem_t)
+    stem_t     = stem_t[idx]; mix_t = mix_t[idx]; drift = drift[idx]
+    med        = median_filter(drift, size=15)
+    good       = np.abs(drift - med) < 80
+    stem_clean = stem_t[good]
+    mix_clean  = mix_t[good]
+
+    print(f"  [warp] {good.sum()} anchors, drift {drift[good].min():.0f}ms→{drift[good].max():.0f}ms")
+    return mix_clean, stem_clean
+
+
+def warp_stem_time(mix_time_s, mix_anchors, stem_anchors):
+    """Given a mix timestamp (seconds), return the corresponding stem timestamp."""
+    if mix_anchors is None:
+        return mix_time_s
+    return float(np.interp(mix_time_s, mix_anchors, stem_anchors))
 
 
 # ── audio I/O ─────────────────────────────────────────────────────────────────
@@ -153,9 +232,38 @@ def merge_bands(bands):
 
 # ── per-band STFT repair ──────────────────────────────────────────────────────
 
+def merge_click_regions(clicks, sr, gap=0.08):
+    """
+    Merge clicks within `gap` seconds of each other into one region.
+    Returns list of (start, end, blend_strength) tuples.
+    blend_strength scales from 1.0 (short/isolated) down to 0.25 (long cluster)
+    so long clusters keep most of the original signal underneath.
+    """
+    if not clicks: return []
+    regions = []
+    gs, ge = clicks[0][1], clicks[0][2]
+    for _, start, end, _ in clicks[1:]:
+        if start - ge < int(gap * sr):
+            ge = max(ge, end)
+        else:
+            regions.append((gs, ge))
+            gs, ge = start, end
+    regions.append((gs, ge))
+
+    result = []
+    for s, e in regions:
+        dur = (e - s) / sr
+        # full repair for short windows; taper to 0.25 for windows >0.5s
+        strength = max(0.25, 1.0 - (dur - 0.01) / 0.5)
+        result.append((s, e, strength))
+    return result
+
 def repair_band(band_data, clicks, sr, n_fft=2048, hop=512, ctx_frames=6):
     out = band_data.copy()
     n   = len(band_data)
+
+    # merge nearby clicks so dense clusters are repaired as one region
+    regions = merge_click_regions(clicks, sr)
 
     for ch in range(band_data.shape[1]):
         sig = band_data[:, ch]
@@ -163,9 +271,10 @@ def repair_band(band_data, clicks, sr, n_fft=2048, hop=512, ctx_frames=6):
                        window='hann', boundary='even')
         mag      = np.abs(Z)
         phase    = np.angle(Z)
+        orig_mag = mag.copy()
         n_frames = Z.shape[1]
 
-        for centre, start, end, _ in clicks:
+        for start, end, strength in regions:
             f0 = max(ctx_frames, start // hop)
             f1 = min(n_frames - 1 - ctx_frames, end // hop + 1)
             if f0 > f1:
@@ -177,7 +286,9 @@ def repair_band(band_data, clicks, sr, n_fft=2048, hop=512, ctx_frames=6):
 
             for fi, frame in enumerate(range(f0, f1 + 1)):
                 t = (fi + 1) / (n_repair + 1)
-                mag[:, frame]   = pre_mag * (1-t) + post_mag * t
+                interp = pre_mag * (1-t) + post_mag * t
+                # blend: full interp for isolated, mostly original for clusters
+                mag[:, frame]   = interp * strength + orig_mag[:, frame] * (1 - strength)
                 phase[:, frame] = (phase[:, max(0,f0-1)] * (1-t) +
                                    phase[:, min(n_frames-1,f1+1)] * t)
 
@@ -190,36 +301,79 @@ def repair_band(band_data, clicks, sr, n_fft=2048, hop=512, ctx_frames=6):
     return out
 
 
-def remove_clicks_spectral(data, clicks, sr):
+def remove_clicks_spectral(data, clicks, sr, dry=None, mix_anchors=None, stem_anchors=None):
     """
     Split into 6 perceptual bands → repair each independently → recombine.
-    Then blend repaired back into the original using a click mask, so the
-    filterbank coloration only affects click regions (not the whole song).
+    Blend repaired back into original via a cosine-faded click mask.
+
+    If dry vocal stem + warp anchors provided: fill click windows with the
+    warp-aligned stem (sample-accurate sync). Falls back to STFT interpolation.
     """
     if not clicks: return data
-    bands    = split_bands(data, sr)
-    repaired = [repair_band(b, clicks, sr) for b in bands]
-    combined = merge_bands(repaired)
-
-    # build a sample-level mask: 1 at clicks, 0 elsewhere, with short crossfade
     n    = len(data)
-    mask = np.zeros(n, dtype=np.float32)
     fade = int(0.005 * sr)  # 5ms crossfade each side
-    for _, start, end, _ in clicks:
-        s = max(0, start - fade)
-        e = min(n, end   + fade)
-        mask[s:e] = 1.0
-        # cosine fade-in
-        fade_in_len = min(fade, start - s)
-        if fade_in_len > 0:
-            mask[s:s+fade_in_len] = (1 - np.cos(np.pi * np.arange(fade_in_len) / fade_in_len)) / 2
-        # cosine fade-out
-        fade_out_len = min(fade, e - end)
-        if fade_out_len > 0:
-            mask[end:end+fade_out_len] = (1 + np.cos(np.pi * np.arange(fade_out_len) / fade_out_len)) / 2
 
-    mask = mask[:, None]  # broadcast over channels
-    return data * (1 - mask) + combined * mask
+    if dry is not None and mix_anchors is not None:
+        # ── warp-aligned stem-fill mode ─────────────────────────────────────
+        dry_n = len(dry)
+        out   = data.copy()
+
+        for _, start, end, _ in clicks:
+            mix_mid_s  = (start + end) / 2 / sr
+            stem_mid_s = warp_stem_time(mix_mid_s, mix_anchors, stem_anchors)
+            half       = (end - start) // 2 + fade
+
+            # extract aligned stem window
+            stem_s = int(stem_mid_s * sr) - half
+            stem_e = stem_s + 2 * half
+            if stem_s < 0 or stem_e > dry_n: continue
+            stem_win = dry[stem_s:stem_e]
+
+            # scale to local mix amplitude
+            ctx_s   = max(0, start - int(0.02 * sr))
+            ctx_e   = min(n, end   + int(0.02 * sr))
+            mix_rms = np.sqrt(np.mean(data[ctx_s:ctx_e] ** 2) + 1e-10)
+            dry_rms = np.sqrt(np.mean(stem_win ** 2) + 1e-10)
+            scale   = mix_rms / dry_rms
+
+            # write into output with cosine fade
+            s = max(0, start - fade)
+            e = min(n, end   + fade)
+            w = np.ones(e - s, dtype=np.float32)
+            fi = min(fade, start - s)
+            if fi > 0: w[:fi] = (1 - np.cos(np.pi * np.arange(fi) / fi)) / 2
+            fo = min(fade, e - end)
+            if fo > 0: w[e - s - fo:] = (1 + np.cos(np.pi * np.arange(fo) / fo)) / 2
+
+            win_len   = e - s
+            stem_trim = stem_win[:win_len]
+            if stem_trim.shape[0] < win_len: continue
+            out[s:e]  = out[s:e] * (1 - w[:, None]) + stem_trim * scale * w[:, None]
+
+        return out
+
+    else:
+        # ── STFT interpolation mode (no stems) ──────────────────────────────
+        bands    = split_bands(data, sr)
+        repaired = [repair_band(b, clicks, sr) for b in bands]
+        combined = merge_bands(repaired)
+
+        # mask over merged regions (not individual clicks)
+        regions = merge_click_regions(clicks, sr)
+        mask = np.zeros(n, dtype=np.float32)
+        for start, end, strength in regions:
+            s = max(0, start - fade)
+            e = min(n, end   + fade)
+            mask[s:e] = strength
+            fi = min(fade, start - s)
+            if fi > 0:
+                mask[s:s+fi] = strength * (1 - np.cos(np.pi * np.arange(fi) / fi)) / 2
+            fo = min(fade, e - end)
+            if fo > 0:
+                mask[end:end+fo] = strength * (1 + np.cos(np.pi * np.arange(fo) / fo)) / 2
+
+        mask = mask[:, None]
+        return data * (1 - mask) + combined * mask
 
 
 # ── interactive file picker ───────────────────────────────────────────────────
@@ -269,6 +423,8 @@ def main():
                     help="Amplitude ratio to flag candidate (default 5.0)")
     ap.add_argument("--similarity", type=float, default=0.70,
                     help="Min fingerprint similarity (default 0.70)")
+    ap.add_argument("--dry",        default=None,
+                    help="Dry vocal stem — fills click windows with natural vocal texture")
     ap.add_argument("--dry-run",    action="store_true")
     args = ap.parse_args()
 
@@ -305,8 +461,25 @@ def main():
             print(f"  {i+1:>4}  {int(m):02d}:{sec:05.2f}  {(e-s)/sr*1000:>5.2f}ms  {fsim:>7.3f}")
 
         if not args.dry_run:
-            print("\n  Repairing per-band with STFT interpolation...")
-            data = remove_clicks_spectral(data, clicks, sr)
+            dry = None
+            mix_anchors = stem_anchors = None
+            if args.dry:
+                if not os.path.isfile(args.dry):
+                    sys.exit(f"Dry stem not found: {args.dry}")
+                dry, _ = load(args.dry)
+                print("\n  Aligning stem to mix with WhisperX...")
+                mix_mono = data.mean(axis=1)
+                dry_mono = dry.mean(axis=1)
+                mix_anchors, stem_anchors = build_stem_warp(mix_mono, dry_mono, sr)
+                if mix_anchors is not None:
+                    print("  Repairing with warp-aligned dry vocal stem...")
+                else:
+                    print("  Warp failed — falling back to STFT interpolation...")
+                    dry = None
+            else:
+                print("\n  Repairing per-band with STFT interpolation...")
+            data = remove_clicks_spectral(data, clicks, sr, dry=dry,
+                                          mix_anchors=mix_anchors, stem_anchors=stem_anchors)
             save(out_path, data, sr)
             print(f"\n  Original untouched : {args.input}")
             print(f"  Clean copy saved   : {out_path}")
