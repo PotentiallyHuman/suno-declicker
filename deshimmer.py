@@ -299,8 +299,8 @@ def main():
                     help="Don't touch below this Hz (default 500)")
     ap.add_argument("--noise-window",   type=int,   default=50,
                     help="Fallback rolling minimum window in frames (default 50)")
-    ap.add_argument("--reverb-wet",     type=float, default=0.10,
-                    help="Reverb mix level 0–1 (default 0.10 = 10%%)")
+    ap.add_argument("--reverb-wet",     type=float, default=0.0,
+                    help="Reverb mix level 0–1 (default 0 = off; try 0.10 for vocal tracks)")
     ap.add_argument("--reverb-time",    type=float, default=1.5,
                     help="Reverb decay RT60 in seconds (default 1.5)")
     ap.add_argument("--no-reverb",      action="store_true",
@@ -349,7 +349,7 @@ def main():
                        band_lo=args.band_lo,
                        noise_window=args.noise_window)
 
-    if not args.no_reverb:
+    if not args.no_reverb and args.reverb_wet > 0:
         print(f"  Adding plate reverb (wet={args.reverb_wet}  RT60={args.reverb_time}s  pre={20}ms)...")
         result = add_reverb_tail(result, sr,
                                  band_lo=args.band_lo,
