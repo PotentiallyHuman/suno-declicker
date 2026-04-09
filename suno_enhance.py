@@ -435,7 +435,7 @@ def _list_audio(directory="."):
                   if os.path.splitext(f)[1].lower() in exts
                   and os.path.isfile(os.path.join(directory, f)))
 
-def _pick(prompt, files, exclude=None):
+def _pick(prompt, files, directory=".", exclude=None):
     exclude   = exclude or []
     available = [(i, f) for i, f in enumerate(files, 1) if f not in exclude]
     if not available: sys.exit("No audio files available.")
@@ -446,34 +446,69 @@ def _pick(prompt, files, exclude=None):
         try:
             n = int(input("\n  Enter number: ").strip())
             m = [f for i, f in available if i == n]
-            if m: return m[0]
+            if m: return os.path.join(directory, m[0])
         except (ValueError, EOFError):
             pass
         print("  Invalid — try again.")
 
-def _interactive():
-    files = _list_audio()
-    if not files:
-        sys.exit("No audio files found in the current directory.")
+def _output_format(paths):
+    """mp3 if every input is mp3, wav otherwise."""
+    return "mp3" if all(p.lower().endswith(".mp3") for p in paths if p) else "wav"
 
+def _save_output(wav_data, sr, out_path, fmt):
+    """Save as wav, then re-encode to mp3 via ffmpeg if needed."""
+    if fmt == "wav":
+        sf.write(out_path, wav_data, sr, subtype="PCM_24")
+    else:
+        tmp = tempfile.mktemp(suffix=".wav")
+        try:
+            sf.write(tmp, wav_data, sr, subtype="PCM_24")
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp, "-codec:a", "libmp3lame",
+                 "-qscale:a", "0", out_path],
+                capture_output=True, check=True)
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
+
+def _interactive():
     print("\n  ┌──────────────────────────────────────────────┐")
     print("  │           suno-enhance  pipeline             │")
     print("  │  declicker → deshimmer → fill reverb         │")
-    print("  └──────────────────────────────────────────────┘")
-    print("\n  Place your Suno files in this folder.")
-    print("  The original is NEVER modified — a clean copy is saved.\n")
+    print("  └──────────────────────────────────────────────┘\n")
 
-    original     = _pick("Select the FULL SONG MIX:", files)
-    vocal        = _pick("Select the VOCAL stem (for click repair):",
-                         files, exclude=[original])
-    instrumental = _pick("Select the INSTRUMENTAL stem (for noise fingerprint):",
-                         files, exclude=[original, vocal])
+    song_name = input("  Song name: ").strip()
+    if not song_name:
+        sys.exit("No song name entered.")
 
-    print(f"\n  Song         : {original}")
-    print(f"  Vocal stem   : {vocal}")
-    print(f"  Instrumental : {instrumental}")
+    session_dir = os.path.join(os.getcwd(), song_name)
+    os.makedirs(session_dir, exist_ok=True)
+    print(f"\n  Created folder: {session_dir}")
+    print("  Opening folder — place your Suno files there, then come back.")
+    try:
+        subprocess.run(["xdg-open", session_dir], check=False)
+    except Exception:
+        pass
+
+    input("\n  Press Enter when your files are in the folder...")
+
+    files = _list_audio(session_dir)
+    if not files:
+        sys.exit(f"No audio files found in {session_dir}")
+
+    print(f"\n  Found {len(files)} audio file(s).")
+
+    original     = _pick("Select the FULL SONG MIX:",              files, session_dir)
+    vocal        = _pick("Select the VOCAL stem:",                  files, session_dir,
+                         exclude=[os.path.basename(original)])
+    instrumental = _pick("Select the INSTRUMENTAL stem:",           files, session_dir,
+                         exclude=[os.path.basename(original),
+                                  os.path.basename(vocal)])
+
+    print(f"\n  Song         : {os.path.basename(original)}")
+    print(f"  Vocal stem   : {os.path.basename(vocal)}")
+    print(f"  Instrumental : {os.path.basename(instrumental)}")
     input("\n  Press Enter to start, or Ctrl+C to cancel. ")
-    return original, vocal, instrumental
+    return original, vocal, instrumental, session_dir
 
 
 def main():
@@ -484,22 +519,25 @@ def main():
     ap.add_argument("--out",            default=None)
     ap.add_argument("--threshold",      type=float, default=5.0)
     ap.add_argument("--similarity",     type=float, default=0.70)
-    ap.add_argument("--shimmer-strength", type=float, default=0.106,
-                    help="Deshimmer subtraction strength (default 0.106)")
+    ap.add_argument("--shimmer-strength", type=float, default=0.106)
     ap.add_argument("--shimmer-floor",  type=float, default=0.90)
-    ap.add_argument("--fill-wet",       type=float, default=0.012,
-                    help="Fill-reverb level for removed content (default 0.012)")
+    ap.add_argument("--fill-wet",       type=float, default=0.012)
     ap.add_argument("--no-compare",     action="store_true")
     args = ap.parse_args()
 
+    session_dir = "."
     if not args.input:
-        args.input, args.vocal, args.instrumental = _interactive()
+        args.input, args.vocal, args.instrumental, session_dir = _interactive()
 
     for p in filter(None, [args.input, args.vocal, args.instrumental]):
         if not os.path.isfile(p):
             sys.exit(f"File not found: {p}")
 
-    out_path = args.out or (os.path.splitext(args.input)[0] + "_enhanced.wav")
+    fmt      = _output_format([args.input, args.vocal, args.instrumental])
+    stem     = os.path.splitext(os.path.basename(args.input))[0]
+    out_name = stem + "_enhanced." + fmt
+    out_path = args.out or os.path.join(session_dir, out_name)
+
     if os.path.abspath(out_path) == os.path.abspath(args.input):
         sys.exit("Output path matches input — refusing to overwrite.")
 
@@ -557,8 +595,9 @@ def main():
         data = fill_removed(original_for_fill, data, sr, wet=args.fill_wet)
     print("        Done.\n")
 
-    save(out_path, data, sr)
-    print(f"  Original untouched : {args.input}")
+    print(f"  Saving as {fmt.upper()}...")
+    _save_output(data, sr, out_path, fmt)
+    print(f"\n  Original untouched : {args.input}")
     print(f"  Enhanced copy saved: {out_path}")
     print(f"{'━'*54}\n")
 
