@@ -426,6 +426,78 @@ def ab_compare(path_a, path_b):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  DEMETALIZER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _align_stems(ref, other):
+    n = len(ref)
+    if len(other) >= n: return other[:n]
+    return np.pad(other, ((0, n - len(other)), (0, 0)))
+
+def _reverb_fingerprint(wet, dry, sr, n_fft=2048, hop=512):
+    dry = _align_stems(wet, dry)
+    fp  = np.zeros(n_fft // 2 + 1, dtype=np.float32)
+    for ch in range(wet.shape[1]):
+        _, _, R = stft(wet[:, ch] - dry[:, ch], fs=sr, nperseg=n_fft,
+                       noverlap=n_fft - hop, window='hann', boundary='even')
+        fp += np.abs(R).mean(axis=1).astype(np.float32)
+    fp /= wet.shape[1]
+    fp  = uniform_filter1d(fp, size=32)
+    fp  = uniform_filter1d(fp, size=32)
+    return fp
+
+def _reverb_envelope(wet, dry, sr, n_fft=2048, hop=512):
+    dry = _align_stems(wet, dry)
+    wet_e = dry_e = np.zeros(1, dtype=np.float32)
+    for ch in range(wet.shape[1]):
+        _, _, W = stft(wet[:, ch], fs=sr, nperseg=n_fft,
+                       noverlap=n_fft - hop, window='hann', boundary='even')
+        _, _, D = stft(dry[:, ch], fs=sr, nperseg=n_fft,
+                       noverlap=n_fft - hop, window='hann', boundary='even')
+        we = np.abs(W).mean(axis=0).astype(np.float32)
+        de = np.abs(D).mean(axis=0).astype(np.float32)
+        if wet_e.shape != we.shape: wet_e = we.copy(); dry_e = de.copy()
+        else: wet_e += we; dry_e += de
+    wet_e /= wet.shape[1]; dry_e /= wet.shape[1]
+    ratio = np.clip(1.0 - dry_e / (wet_e + 1e-10), 0.0, 1.0)
+    return uniform_filter1d(ratio, size=24)
+
+def demetalize(song, fingerprint, envelope, sr, strength=0.8,
+               floor=0.85, band_lo=2000, band_hi=8000, n_fft=2048, hop=512):
+    n     = len(song)
+    out   = np.zeros_like(song)
+    freqs = np.linspace(0, sr / 2, n_fft // 2 + 1)
+    freq_mask = ((freqs >= band_lo) & (freqs <= band_hi)).astype(np.float32)
+    fade = 10
+    lo_idx = np.searchsorted(freqs, band_lo)
+    hi_idx = np.searchsorted(freqs, band_hi)
+    for i in range(fade):
+        t = (i + 1) / (fade + 1)
+        if lo_idx + i < len(freq_mask): freq_mask[lo_idx - fade + i] *= t
+        if hi_idx - i - 1 >= 0:        freq_mask[hi_idx - i] *= t
+
+    env = envelope.astype(np.float32)
+    for ch in range(song.shape[1]):
+        _, _, S = stft(song[:, ch], fs=sr, nperseg=n_fft,
+                       noverlap=n_fft - hop, window='hann', boundary='even')
+        mag   = np.abs(S); phase = np.angle(S)
+        n_f   = mag.shape[1]
+        env_t = env[:n_f] if len(env) >= n_f else np.pad(env, (0, n_f - len(env)))
+        rms   = mag.mean(axis=0)
+        gate  = uniform_filter1d(
+                    np.clip(rms / (np.median(rms) * 0.5 + 1e-10), 0.0, 1.0).astype(np.float32),
+                    size=16)
+        sub   = (strength * fingerprint[:, None] * freq_mask[:, None]
+                 * env_t[None, :] * gate[None, :])
+        mag_c = np.maximum(mag - sub, mag * floor)
+        _, rep = istft(mag_c * np.exp(1j * phase), fs=sr, nperseg=n_fft,
+                       noverlap=n_fft - hop, window='hann', boundary='even')
+        rep = rep[:n] if len(rep) >= n else np.pad(rep, (0, n - len(rep)))
+        out[:, ch] = rep.astype(np.float32)
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  INTERACTIVE SETUP + CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -451,110 +523,153 @@ def _pick(prompt, files, directory=".", exclude=None):
             pass
         print("  Invalid — try again.")
 
+def _yn(prompt):
+    return input(f"  {prompt} (y/N): ").strip().lower() == 'y'
+
 def _output_format(paths):
-    """mp3 if every input is mp3, wav otherwise."""
     return "mp3" if all(p.lower().endswith(".mp3") for p in paths if p) else "wav"
 
 def _save_output(wav_data, sr, out_path, fmt):
-    """Save as wav, then re-encode to mp3 via ffmpeg if needed."""
     if fmt == "wav":
         sf.write(out_path, wav_data, sr, subtype="PCM_24")
     else:
         tmp = tempfile.mktemp(suffix=".wav")
         try:
             sf.write(tmp, wav_data, sr, subtype="PCM_24")
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", tmp, "-codec:a", "libmp3lame",
-                 "-qscale:a", "0", out_path],
-                capture_output=True, check=True)
+            subprocess.run(["ffmpeg", "-y", "-i", tmp, "-codec:a", "libmp3lame",
+                            "-qscale:a", "0", out_path],
+                           capture_output=True, check=True)
         finally:
             if os.path.exists(tmp): os.unlink(tmp)
 
 def _interactive():
     print("\n  ┌──────────────────────────────────────────────┐")
-    print("  │           suno-enhance  pipeline             │")
-    print("  │  declicker → deshimmer → fill reverb         │")
+    print("  │              suno-enhance                    │")
     print("  └──────────────────────────────────────────────┘\n")
 
     song_name = input("  Song name: ").strip()
-    if not song_name:
-        sys.exit("No song name entered.")
+    if not song_name: sys.exit("No song name entered.")
 
     session_dir = os.path.join(os.getcwd(), song_name)
     os.makedirs(session_dir, exist_ok=True)
-    print(f"\n  Created folder: {session_dir}")
-    print("  Opening folder — place your Suno files there, then come back.")
+    print(f"\n  Folder: {session_dir}")
+    print("  Opening folder — place your Suno files there, then come back.\n")
     try:
         subprocess.run(["xdg-open", session_dir], check=False)
     except Exception:
         pass
 
-    input("\n  Press Enter when your files are in the folder...")
+    # select processes
+    print("  Which processes do you want to run?\n")
+    do_deshimmer   = _yn("Deshimmer   (removes AI noise floor using instrumental stem)")
+    do_demetalizer = _yn("Demetalizer (removes metallic reverb using wet/dry vocal stems)")
+
+    # required files
+    print("\n  Required files:")
+    print("    - Full song mix                        (always)")
+    print("    - Wet vocal stem with effects          (always — for click repair)")
+    print("    - Instrumental stem                    (always — for click repair" +
+          (" + deshimmer)" if do_deshimmer else ")"))
+    if do_demetalizer:
+        print("    - Dry vocal stem without effects       (for demetalizer)")
+
+    input("\n  Press Enter when all files are in the folder...")
 
     files = _list_audio(session_dir)
     if not files:
         sys.exit(f"No audio files found in {session_dir}")
 
-    print(f"\n  Found {len(files)} audio file(s).")
+    print(f"\n  Found {len(files)} file(s). Assign each one:\n")
+    used = []
 
-    original     = _pick("Select the FULL SONG MIX:",              files, session_dir)
-    vocal        = _pick("Select the VOCAL stem:",                  files, session_dir,
-                         exclude=[os.path.basename(original)])
-    instrumental = _pick("Select the INSTRUMENTAL stem:",           files, session_dir,
-                         exclude=[os.path.basename(original),
-                                  os.path.basename(vocal)])
+    original = _pick("Full song mix:", files, session_dir)
+    used.append(os.path.basename(original))
 
-    print(f"\n  Song         : {os.path.basename(original)}")
-    print(f"  Vocal stem   : {os.path.basename(vocal)}")
+    wet_vocal = _pick("Wet vocal stem WITH effects (Suno extracted):", files, session_dir, exclude=used)
+    used.append(os.path.basename(wet_vocal))
+
+    instrumental = _pick("Instrumental stem:", files, session_dir, exclude=used)
+    used.append(os.path.basename(instrumental))
+
+    dry_vocal = None
+    if do_demetalizer:
+        dry_vocal = _pick("Dry vocal stem WITHOUT effects (Suno Studio, no FX):", files, session_dir, exclude=used)
+        used.append(os.path.basename(dry_vocal))
+
+    print(f"\n  Song mix     : {os.path.basename(original)}")
+    print(f"  Wet vocal    : {os.path.basename(wet_vocal)}")
     print(f"  Instrumental : {os.path.basename(instrumental)}")
+    if dry_vocal:
+        print(f"  Dry vocal    : {os.path.basename(dry_vocal)}")
+    print(f"\n  Deshimmer    : {'yes' if do_deshimmer else 'no'}")
+    print(f"  Demetalizer  : {'yes' if do_demetalizer else 'no'}")
     input("\n  Press Enter to start, or Ctrl+C to cancel. ")
-    return original, vocal, instrumental, session_dir
+
+    return (original, wet_vocal, instrumental, dry_vocal,
+            do_deshimmer, do_demetalizer, session_dir)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Suno AI audio enhancement pipeline.")
-    ap.add_argument("input",            nargs="?",  default=None)
-    ap.add_argument("--vocal",          default=None)
-    ap.add_argument("--instrumental",   default=None)
-    ap.add_argument("--out",            default=None)
-    ap.add_argument("--threshold",      type=float, default=5.0)
-    ap.add_argument("--similarity",     type=float, default=0.70)
+    ap.add_argument("input",              nargs="?", default=None)
+    ap.add_argument("--wet-vocal",        default=None, help="Wet vocal stem (with effects)")
+    ap.add_argument("--dry-vocal",        default=None, help="Dry vocal stem (no effects, for demetalizer)")
+    ap.add_argument("--instrumental",     default=None)
+    ap.add_argument("--out",              default=None)
+    ap.add_argument("--deshimmer",        action="store_true")
+    ap.add_argument("--demetalizer",      action="store_true")
+    ap.add_argument("--threshold",        type=float, default=5.0)
+    ap.add_argument("--similarity",       type=float, default=0.70)
     ap.add_argument("--shimmer-strength", type=float, default=0.106)
-    ap.add_argument("--shimmer-floor",  type=float, default=0.90)
-    ap.add_argument("--fill-wet",       type=float, default=0.012)
-    ap.add_argument("--no-compare",     action="store_true")
+    ap.add_argument("--shimmer-floor",    type=float, default=0.90)
+    ap.add_argument("--fill-wet",         type=float, default=0.012)
+    ap.add_argument("--no-compare",       action="store_true")
     args = ap.parse_args()
 
-    session_dir = "."
-    if not args.input:
-        args.input, args.vocal, args.instrumental, session_dir = _interactive()
+    session_dir    = "."
+    do_deshimmer   = args.deshimmer
+    do_demetalizer = args.demetalizer
+    wet_vocal      = args.wet_vocal
+    dry_vocal      = args.dry_vocal
 
-    for p in filter(None, [args.input, args.vocal, args.instrumental]):
+    if not args.input:
+        (args.input, wet_vocal, args.instrumental, dry_vocal,
+         do_deshimmer, do_demetalizer, session_dir) = _interactive()
+
+    for p in filter(None, [args.input, wet_vocal, args.instrumental, dry_vocal]):
         if not os.path.isfile(p):
             sys.exit(f"File not found: {p}")
 
-    fmt      = _output_format([args.input, args.vocal, args.instrumental])
-    stem     = os.path.splitext(os.path.basename(args.input))[0]
-    out_name = stem + "_enhanced." + fmt
-    out_path = args.out or os.path.join(session_dir, out_name)
+    all_inputs = [p for p in [args.input, wet_vocal, args.instrumental, dry_vocal] if p]
+    fmt        = _output_format(all_inputs)
+    stem       = os.path.splitext(os.path.basename(args.input))[0]
+    out_path   = args.out or os.path.join(session_dir, stem + "_enhanced." + fmt)
 
     if os.path.abspath(out_path) == os.path.abspath(args.input):
         sys.exit("Output path matches input — refusing to overwrite.")
+
+    steps = (["declicker"] +
+             (["deshimmer"]   if do_deshimmer   else []) +
+             (["demetalizer"] if do_demetalizer else []))
 
     print(f"\n{'━'*54}")
     print(f"  suno-enhance")
     print(f"{'━'*54}")
     print(f"  Input        : {os.path.basename(args.input)}")
-    if args.vocal:        print(f"  Vocal stem   : {os.path.basename(args.vocal)}")
+    if wet_vocal:         print(f"  Wet vocal    : {os.path.basename(wet_vocal)}")
     if args.instrumental: print(f"  Instrumental : {os.path.basename(args.instrumental)}")
+    if dry_vocal:         print(f"  Dry vocal    : {os.path.basename(dry_vocal)}")
+    print(f"  Steps        : {' → '.join(steps)}")
     print(f"  Output       : {os.path.basename(out_path)}")
     print(f"{'━'*54}\n")
 
     data, sr = load(args.input)
+    instr    = None
     print(f"  {sr} Hz | {data.shape[1]}ch | {len(data)/sr:.1f}s\n")
 
-    # ── step 1: declicker ────────────────────────────────────────────────────
-    print("  [1/2] Declicker")
+    # ── declicker ────────────────────────────────────────────────────────────
+    step_n = 1
+    print(f"  [{step_n}/{len(steps)}] Declicker")
     clicks = detect_clicks(data, sr, args.threshold, args.similarity)
     if not clicks:
         print("        No Suno artifact clicks detected.\n")
@@ -565,35 +680,51 @@ def main():
         for i, (c, s, e, fsim, nov) in enumerate(clicks):
             t = c / sr; m, sec = divmod(t, 60)
             print(f"  {i+1:>4}  {int(m):02d}:{sec:05.2f}  {(e-s)/sr*1000:>5.2f}ms  {fsim:>7.3f}")
-        if args.vocal and args.instrumental:
+        if wet_vocal and args.instrumental:
             print("\n        Repairing with stems...")
-            vocal, _ = load(args.vocal)
-            instr, _ = load(args.instrumental)
-            data = remove_clicks_with_stems(data, clicks, vocal, instr, sr)
+            vocal_data, _ = load(wet_vocal)
+            instr,       _ = load(args.instrumental)
+            data = remove_clicks_with_stems(data, clicks, vocal_data, instr, sr)
         else:
             print("\n        Repairing with cubic spline...")
             data = remove_clicks(data, clicks, sr)
         print("        Done.\n")
+    step_n += 1
 
-    # ── step 2: deshimmer ────────────────────────────────────────────────────
-    print("  [2/2] Deshimmer")
-    fingerprint = None
-    if args.instrumental:
-        if 'instr' not in dir():
+    # ── deshimmer ─────────────────────────────────────────────────────────────
+    if do_deshimmer:
+        print(f"  [{step_n}/{len(steps)}] Deshimmer")
+        if instr is None and args.instrumental:
             instr, _ = load(args.instrumental)
-        print(f"        Extracting noise fingerprint from instrumental stem...")
-        fingerprint = _noise_fingerprint_from_stem(data, instr, sr)
-    else:
-        print("        No instrumental stem — using minimum-statistics fallback.")
+        fingerprint = None
+        if instr is not None:
+            print("        Extracting noise fingerprint from instrumental stem...")
+            fingerprint = _noise_fingerprint_from_stem(data, instr, sr)
+        else:
+            print("        No instrumental stem — using minimum-statistics fallback.")
+        pre_shimmer = data.copy()
+        data = deshimmer(data, sr, fingerprint=fingerprint,
+                         strength=args.shimmer_strength, floor=args.shimmer_floor)
+        if args.fill_wet > 0:
+            print(f"        Fill reverb (wet={args.fill_wet})...")
+            data = fill_removed(pre_shimmer, data, sr, wet=args.fill_wet)
+        print("        Done.\n")
+        step_n += 1
 
-    original_for_fill = data.copy()
-    data = deshimmer(data, sr, fingerprint=fingerprint,
-                     strength=args.shimmer_strength, floor=args.shimmer_floor)
-
-    if args.fill_wet > 0:
-        print(f"        Fill reverb (wet={args.fill_wet})...")
-        data = fill_removed(original_for_fill, data, sr, wet=args.fill_wet)
-    print("        Done.\n")
+    # ── demetalizer ───────────────────────────────────────────────────────────
+    if do_demetalizer:
+        print(f"  [{step_n}/{len(steps)}] Demetalizer")
+        wet_v, _ = load(wet_vocal)
+        dry_v, _ = load(dry_vocal)
+        print("        Building reverb fingerprint from wet/dry vocal comparison...")
+        fp  = _reverb_fingerprint(wet_v, dry_v, sr)
+        print(f"        Peak metallic frequency: {np.argmax(fp) * sr / 2048:.0f} Hz")
+        print("        Computing reverb presence envelope...")
+        env = _reverb_envelope(wet_v, dry_v, sr)
+        print(f"        Reverb-only frames: {(env > 0.5).sum()} / {len(env)}")
+        print("        Subtracting metallic reverb (2–8 kHz, reverb-tail frames only)...")
+        data = demetalize(data, fp, env, sr)
+        print("        Done.\n")
 
     print(f"  Saving as {fmt.upper()}...")
     _save_output(data, sr, out_path, fmt)
