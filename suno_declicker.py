@@ -144,7 +144,6 @@ def main():
         "--instrumental", instrumental,
         "--repair-mode",  "median",
         "--out",          out_path,
-        "--no-compare",
     ]
 
     result = subprocess.run(cmd)

@@ -24,6 +24,13 @@ The original file is **never modified**. All repairs are written to a new copy.
 
 ## Results
 
+Listen to the difference:
+
+| | Link |
+|---|---|
+| **Before** (with clicks) | https://suno.com/s/nIZaTacfGFhGR3ts |
+| **After** (declicked) | https://suno.com/s/sBiI6H2a9OsqKKp9 |
+
 3-panel spectrogram comparison — same song, full duration:
 
 - **Top**: original (clicks visible as bright vertical lines)
